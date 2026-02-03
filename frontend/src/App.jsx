@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { ethers } from "ethers";
 import { ABI, CONTRACT_ADDRESS } from "./contract";
 
-const SEPOLIA_RPC = "https://1rpc.io/sepolia";
+const SEPOLIA_RPC = "https://gateway.tenderly.co/public/sepolia";
 
 async function sha256File(file) {
   const buf = await file.arrayBuffer();
@@ -51,6 +51,71 @@ export default function App() {
       await tx.wait();
       setStatus("Issued on-chain ✅");
     } catch (err) {
+      setStatus("Error: " + (err.reason || err.message));
+    }
+  }
+
+  // --- EIP-712 Typed Data Logic ---
+  const [studentName, setStudentName] = useState("");
+  const [course, setCourse] = useState("");
+  const [structFile, setStructFile] = useState(null);
+
+  async function issueWithSignature() {
+    if (!walletProvider) return setStatus("Connect MetaMask first.");
+    if (!studentName || !course || !structFile) return setStatus("Enter name, course, and select a file.");
+
+    const signer = await walletProvider.getSigner();
+    const network = await walletProvider.getNetwork();
+    const chainId = network.chainId;
+
+    // Hash the file first
+    const fileHash = await sha256File(structFile);
+
+    const domain = {
+      name: "CredentialRegistry",
+      version: "1",
+      chainId: Number(chainId),
+      verifyingContract: CONTRACT_ADDRESS,
+    };
+
+    const types = {
+      Credential: [
+        { name: "docHash", type: "bytes32" },
+        { name: "studentName", type: "string" },
+        { name: "course", type: "string" },
+        { name: "issueDate", type: "uint64" },
+      ],
+    };
+
+    const issueDate = Math.floor(Date.now() / 1000); // Current unix timestamp
+
+    const value = {
+      docHash: fileHash,
+      studentName,
+      course,
+      issueDate,
+    };
+
+    setStatus("Requesting signature…");
+
+    try {
+      // 1. Sign Typed Data (off-chain)
+      const signature = await signer.signTypedData(domain, types, value);
+      const sig = ethers.Signature.from(signature);
+
+      setStatus("Signature valid! Submission to chain…");
+
+      // 2. Submit to chain
+      const reg = new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
+
+      // Notice: issueWithSignature(tuple, v, r, s)
+      const tx = await reg.issueWithSignature(value, sig.v, sig.r, sig.s);
+      await tx.wait();
+
+      setStatus("Issued with Typed Data ✅");
+      setDocHash(fileHash);
+    } catch (err) {
+      console.error(err);
       setStatus("Error: " + (err.reason || err.message));
     }
   }
@@ -117,7 +182,7 @@ export default function App() {
       <h1>Credential Registry</h1>
 
       <button onClick={connect} disabled={!hasWallet}>
-        {account ? `Connected: ${account.slice(0,6)}…${account.slice(-4)}` : "Connect MetaMask"}
+        {account ? `Connected: ${account.slice(0, 6)}…${account.slice(-4)}` : "Connect MetaMask"}
       </button>
 
       <p>{status}</p>
@@ -129,13 +194,33 @@ export default function App() {
 
       <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
         <label>
-          Issue:
-          <input type="file" accept="application/pdf" onChange={(e) => e.target.files?.[0] && issue(e.target.files[0])}/>
+          Issue (Standard):
+          <input type="file" accept="application/pdf" onChange={(e) => e.target.files?.[0] && issue(e.target.files[0])} />
         </label>
         <label>
           Revoke:
-          <input type="file" accept="application/pdf" onChange={(e) => e.target.files?.[0] && revoke(e.target.files[0])}/>
+          <input type="file" accept="application/pdf" onChange={(e) => e.target.files?.[0] && revoke(e.target.files[0])} />
         </label>
+      </div>
+
+      <h3>Issue with Structured Data (EIP-712)</h3>
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12 }}>
+        <input
+          placeholder="Student Name"
+          value={studentName}
+          onChange={(e) => setStudentName(e.target.value)}
+        />
+        <input
+          placeholder="Course Name"
+          value={course}
+          onChange={(e) => setCourse(e.target.value)}
+        />
+        <input
+          type="file"
+          accept="application/pdf"
+          onChange={(e) => setStructFile(e.target.files?.[0] || null)}
+        />
+        <button onClick={issueWithSignature}>Sign & Issue</button>
       </div>
 
       <hr />
@@ -143,7 +228,7 @@ export default function App() {
       <h2>Verifier</h2>
       <label>
         Verify:
-        <input type="file" accept="application/pdf" onChange={(e) => e.target.files?.[0] && verify(e.target.files[0])}/>
+        <input type="file" accept="application/pdf" onChange={(e) => e.target.files?.[0] && verify(e.target.files[0])} />
       </label>
 
       {docHash && <p><b>Document hash:</b> {docHash}</p>}
@@ -164,7 +249,7 @@ export default function App() {
       <ul>
         {events.map((e, i) => (
           <li key={i}>
-            <b>{e.name}</b> — {e.hash} — issuer {e.issuer.slice(0,6)}… — block {e.block}
+            <b>{e.name}</b> — {e.hash} — issuer {e.issuer.slice(0, 6)}… — block {e.block}
           </li>
         ))}
       </ul>
