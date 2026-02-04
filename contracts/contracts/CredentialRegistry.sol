@@ -8,12 +8,13 @@ import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 contract CredentialRegistry is AccessControl, EIP712 {
     bytes32 public constant ISSUER_ROLE = keccak256("ISSUER_ROLE");
     bytes32 private constant CREDENTIAL_TYPEHASH =
-        keccak256("Credential(bytes32 docHash,string studentName,string course,uint64 issueDate)");
+        keccak256("Credential(bytes32 docHash,string studentName,string course,uint64 issueDate,string ipfsCid)");
 
     struct Record {
         uint64 issuedAt;
         bool revoked;
         address issuer;
+        string ipfsCid; // [NEW] IPFS CID
     }
 
     struct Credential {
@@ -21,11 +22,12 @@ contract CredentialRegistry is AccessControl, EIP712 {
         string studentName;
         string course;
         uint64 issueDate;
+        string ipfsCid; // [NEW] IPFS CID
     }
 
     mapping(bytes32 => Record) public records;
 
-    event Issued(bytes32 indexed docHash, address indexed issuer, uint64 issuedAt);
+    event Issued(bytes32 indexed docHash, address indexed issuer, uint64 issuedAt, string ipfsCid);
     event Revoked(bytes32 indexed docHash, address indexed issuer, uint64 revokedAt);
 
     constructor(address admin) EIP712("CredentialRegistry", "1") {
@@ -44,7 +46,7 @@ contract CredentialRegistry is AccessControl, EIP712 {
 
     // Main actions
     function issue(bytes32 docHash) external onlyRole(ISSUER_ROLE) {
-        _issue(docHash, msg.sender);
+        _issue(docHash, msg.sender, "");
     }
 
     function issueWithSignature(
@@ -59,7 +61,8 @@ contract CredentialRegistry is AccessControl, EIP712 {
                 credential.docHash,
                 keccak256(bytes(credential.studentName)),
                 keccak256(bytes(credential.course)),
-                credential.issueDate
+                credential.issueDate,
+                keccak256(bytes(credential.ipfsCid))
             )
         );
         bytes32 hash = _hashTypedDataV4(structHash);
@@ -68,13 +71,13 @@ contract CredentialRegistry is AccessControl, EIP712 {
         require(hasRole(ISSUER_ROLE, signer), "signer is not an issuer");
         
         // Use the docHash from the credentials as the storage key
-        _issue(credential.docHash, signer);
+        _issue(credential.docHash, signer, credential.ipfsCid);
     }
 
-    function _issue(bytes32 docHash, address issuer) internal {
+    function _issue(bytes32 docHash, address issuer, string memory ipfsCid) internal {
         require(records[docHash].issuedAt == 0, "already issued");
-        records[docHash] = Record(uint64(block.timestamp), false, issuer);
-        emit Issued(docHash, issuer, uint64(block.timestamp));
+        records[docHash] = Record(uint64(block.timestamp), false, issuer, ipfsCid);
+        emit Issued(docHash, issuer, uint64(block.timestamp), ipfsCid);
     }
 
     function revoke(bytes32 docHash) external onlyRole(ISSUER_ROLE) {
@@ -86,12 +89,13 @@ contract CredentialRegistry is AccessControl, EIP712 {
     function verify(bytes32 docHash)
         external
         view
-        returns (bool issued, bool revoked, uint64 issuedAt, address issuer)
+        returns (bool issued, bool revoked, uint64 issuedAt, address issuer, string memory ipfsCid)
     {
         Record memory r = records[docHash];
         issued = r.issuedAt != 0;
         revoked = r.revoked;
         issuedAt = r.issuedAt;
         issuer = r.issuer;
+        ipfsCid = r.ipfsCid;
     }
 }

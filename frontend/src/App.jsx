@@ -1,14 +1,31 @@
 import { useMemo, useState } from "react";
 import { ethers } from "ethers";
+import axios from "axios"; // [NEW]
 import { ABI, CONTRACT_ADDRESS } from "./contract";
 
 // Use Tenderly public or Alchemy if configured
 const SEPOLIA_RPC = "https://gateway.tenderly.co/public/sepolia";
+const PINATA_JWT = import.meta.env.VITE_PINATA_JWT; // [NEW] Read from .env
 
 async function sha256File(file) {
   const buf = await file.arrayBuffer();
   const hash = await crypto.subtle.digest("SHA-256", buf);
   return "0x" + [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// [NEW] Upload to IPFS via Pinata
+async function uploadToIPFS(file) {
+  if (!PINATA_JWT) throw new Error("Missing VITE_PINATA_JWT in .env file");
+
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const res = await axios.post("https://api.pinata.cloud/pinning/pinFileToIPFS", formData, {
+    headers: {
+      Authorization: `Bearer ${PINATA_JWT}`,
+    },
+  });
+  return res.data.IpfsHash; // Returns the CID
 }
 
 export default function App() {
@@ -76,8 +93,19 @@ export default function App() {
     const network = await walletProvider.getNetwork();
     const chainId = network.chainId;
 
-    // Hash the file first
+    setStatus("Hashing file...");
     const fileHash = await sha256File(structFile);
+
+    // [NEW] Upload to IPFS
+    setStatus("Uploading to IPFS (this may take a moment)...");
+    let ipfsCid = "";
+    try {
+      ipfsCid = await uploadToIPFS(structFile);
+      setStatus("Uploaded to IPFS! 📦 CID: " + ipfsCid);
+    } catch (err) {
+      console.error(err);
+      return setStatus("IPFS Upload Failed: " + (err.message || "Unknown error"));
+    }
 
     const domain = {
       name: "CredentialRegistry",
@@ -86,25 +114,29 @@ export default function App() {
       verifyingContract: CONTRACT_ADDRESS,
     };
 
+    // [UPDATED] Added ipfsCid
     const types = {
       Credential: [
         { name: "docHash", type: "bytes32" },
         { name: "studentName", type: "string" },
         { name: "course", type: "string" },
         { name: "issueDate", type: "uint64" },
+        { name: "ipfsCid", type: "string" }, // [NEW]
       ],
     };
 
     const issueDate = Math.floor(Date.now() / 1000); // Current unix timestamp
 
+    // [UPDATED] Added ipfsCid
     const value = {
       docHash: fileHash,
       studentName,
       course,
       issueDate,
+      ipfsCid, // [NEW]
     };
 
-    setStatus("Requesting signature…");
+    setStatus("Requesting signature...");
 
     try {
       // 1. Sign Typed Data (off-chain)
@@ -119,7 +151,7 @@ export default function App() {
       const tx = await reg.issueWithSignature(value, sig.v, sig.r, sig.s);
       await tx.wait();
 
-      setStatus("Issued with Typed Data ✅");
+      setStatus("Issued with Typed Data & IPFS ✅");
       setDocHash(fileHash);
     } catch (err) {
       console.error(err);
@@ -149,12 +181,14 @@ export default function App() {
     setDocHash(h);
     setStatus("Checking chain…");
     try {
+      // [UPDATED] Verify returns extra param now
       const res = await reg.verify(h);
       setVerifyResult({
         issued: res[0],
         revoked: res[1],
         issuedAt: Number(res[2]),
         issuer: res[3],
+        ipfsCid: res[4], // [NEW]
       });
       setStatus("Done.");
     } catch (err) {
@@ -166,20 +200,26 @@ export default function App() {
     const reg = new ethers.Contract(CONTRACT_ADDRESS, ABI, readProvider);
     setStatus("Loading recent events…");
     try {
+      // Fetch latest 50 events to ensure we find some
       const issued = await reg.queryFilter(reg.filters.Issued(), -5000);
       const revoked = await reg.queryFilter(reg.filters.Revoked(), -5000);
+
       const all = [...issued, ...revoked]
-        .sort((a, b) => (a.blockNumber - b.blockNumber))
-        .slice(-20)
+        .sort((a, b) => (a.blockNumber - b.blockNumber)) // Newest last (log order) -> reverse for UI
+        .reverse() // [UPDATED] Show newest first
+        .slice(0, 20)
         .map(e => ({
           name: e.fragment.name,
           hash: e.args.docHash,
           issuer: e.args.issuer,
+          cid: e.args[3], // [UPDATED] Index 3 is ipfsCid in Issued(hash, issuer, date, cid)
           block: e.blockNumber
         }));
+
       setEvents(all);
       setStatus("Events loaded.");
     } catch (err) {
+      console.error(err);
       setStatus("Error: " + (err.reason || err.message));
     }
   }
@@ -228,8 +268,15 @@ export default function App() {
         </header>
 
         {status && (
-          <div className="mb-8 p-4 rounded-xl bg-zinc-900/50 border border-zinc-800 text-center text-sm font-medium text-zinc-400 animate-fade-in">
+          <div className="mb-8 p-4 rounded-xl bg-zinc-900/50 border border-zinc-800 text-center text-sm font-medium text-zinc-400 animate-fade-in break-words">
             {status}
+          </div>
+        )}
+
+        {/* Warning if no IPFS Key */}
+        {!PINATA_JWT && (
+          <div className="mb-8 p-4 rounded-xl bg-amber-500/10 border border-amber-500/20 text-center text-sm font-medium text-amber-500">
+            ⚠️ No IPFS Key specificed. Create a .env file with VITE_PINATA_JWT to enable uploads.
           </div>
         )}
 
@@ -255,7 +302,7 @@ export default function App() {
                 <div className="bg-black/20 rounded-xl p-6 border border-white/5">
                   <h3 className="text-xs font-bold uppercase tracking-wider text-emerald-500 mb-4 flex items-center gap-2">
                     <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
-                    Structured Issue (EIP-712)
+                    Structured Issue (EIP-712 + IPFS)
                   </h3>
                   <div className="grid grid-cols-1 gap-4 mb-4">
                     <input
@@ -341,6 +388,21 @@ export default function App() {
                         <span className="text-zinc-500">Timestamp</span>
                         <span className="text-zinc-300">{new Date(Number(verifyResult.issuedAt) * 1000).toLocaleDateString()}</span>
                       </div>
+
+                      {/* [NEW] IPFS Download Link */}
+                      {verifyResult.ipfsCid && verifyResult.ipfsCid.length > 5 && (
+                        <div className="mt-4 pt-4 border-t border-white/5">
+                          <a
+                            href={`https://ipfs.io/ipfs/${verifyResult.ipfsCid}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="block w-full text-center py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-xs font-bold text-white transition-colors"
+                          >
+                            DOWNLOAD ORIGINAL PDF (IPFS)
+                          </a>
+                        </div>
+                      )}
+
                     </div>
                   )}
                 </div>
@@ -350,9 +412,9 @@ export default function App() {
             {/* Audit Log */}
             <div className="glass-panel p-6 flex-1">
               <div className="flex justify-between items-center mb-5">
-                <h2 className="text-sm font-semibold text-zinc-400 uppercase tracking-widest">Live Feed</h2>
+                <h2 className="text-sm font-semibold text-zinc-400 uppercase tracking-widest">Public Registry</h2>
                 <button onClick={loadEvents} className="text-xs text-emerald-500 hover:text-emerald-400 font-medium transition-colors">
-                  Refresh
+                  Refresh List
                 </button>
               </div>
 
@@ -363,7 +425,15 @@ export default function App() {
                     <div className="flex items-center gap-3">
                       <div className={`w-1.5 h-1.5 rounded-full ${e.name === 'Revoked' ? 'bg-red-500' : 'bg-emerald-500'}`}></div>
                       <div>
-                        <div className="text-xs font-medium text-zinc-300">{e.name} Credential</div>
+                        <div className="text-xs font-medium text-zinc-300 flex items-center gap-2">
+                          {e.name} Credential
+                          {/* [NEW] Download Icon in Feed */}
+                          {e.cid && e.cid.length > 5 && (
+                            <a href={`https://ipfs.io/ipfs/${e.cid}`} target="_blank" rel="noreferrer" className="text-indigo-400 hover:text-indigo-300" title="Download">
+                              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                            </a>
+                          )}
+                        </div>
                         <div className="text-[10px] font-mono text-zinc-600 mt-0.5 group-hover:text-zinc-500 transition-colors">{e.hash.slice(0, 8)}...</div>
                       </div>
                     </div>
